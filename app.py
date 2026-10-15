@@ -15,8 +15,12 @@ from insert_images import (
     STATUS_NO_TABLE,
     STATUS_NORMAL,
     collect_images_from_folder,
+    create_document_from_images,
+    default_created_document_path,
     default_output_path,
+    list_document_images,
     process_document,
+    validate_table_size,
 )
 
 # onefile exe 에서 __file__ 은 임시 압축 해제 폴더라서 exe 위치를 기준으로 삼는다.
@@ -66,7 +70,14 @@ class App:
         self.build_layout()
 
     def build_layout(self):
-        frame = ttk.Frame(self.root, padding=PAD_OUTER)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True)
+        self.insert_tab = ttk.Frame(self.notebook)
+        self.create_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.insert_tab, text="기존 문서에 삽입")
+        self.notebook.add(self.create_tab, text="이미지로 문서 생성")
+        self.creator = CreateDocumentTab(self, self.create_tab)
+        frame = ttk.Frame(self.insert_tab, padding=PAD_OUTER)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(6, weight=1)
@@ -332,6 +343,7 @@ class App:
                              tags=("exception",) if row.is_exception else ())
 
     def set_running(self, running: bool):
+        self.notebook.tab(self.create_tab, state="disabled" if running else "normal")
         self.run_button.configure(state="disabled" if running else "normal")
         if running:
             self.ignore_save_button.configure(state="disabled")
@@ -342,6 +354,233 @@ class App:
     def show_status(self, text: str, color: str):
         self.status_text.set(text)
         self.status_label.configure(foreground=color)
+
+
+class CreateDocumentTab:
+    """새 문서 탭의 입력·표시만 담당하며 문서 처리는 insert_images에 위임한다."""
+
+    def __init__(self, app: App, parent):
+        self.app = app
+        self.root = app.root
+        self.folder = tk.StringVar(value=str(DEFAULT_IMAGE_DIR))
+        self.suggested_output = str(default_created_document_path(DEFAULT_IMAGE_DIR))
+        self.output = tk.StringVar(value=self.suggested_output)
+        self.width = tk.StringVar(value="16")
+        self.height = tk.StringVar(value="10")
+        self.summary = tk.StringVar(value="이미지 -  ·  생성 표 -  ·  정상 -  ·  오류 -")
+        self.status = tk.StringVar(value="이미지 폴더를 지정하고 목록을 확인하세요.")
+        self.images = []
+        self.loaded_folder = None
+        self.last_inputs = None
+        self.last_output = None
+        self.result_queue = queue.Queue()
+        self.input_widgets = []
+
+        frame = ttk.Frame(parent, padding=PAD_OUTER)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(6, weight=1)
+        for row, label, variable, command in (
+                (0, "이미지 폴더", self.folder, self.browse_folder),
+                (1, "결과 파일", self.output, self.browse_output)):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=(0, PAD_ROW))
+            entry = ttk.Entry(frame, textvariable=variable)
+            entry.grid(row=row, column=1, sticky="ew", padx=PAD_ROW, pady=(0, PAD_ROW))
+            button = ttk.Button(frame, text="찾기", command=command)
+            button.grid(row=row, column=2, pady=(0, PAD_ROW))
+            self.input_widgets.extend((entry, button))
+
+        size_row = ttk.Frame(frame)
+        size_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, PAD_ROW))
+        for column, (label, variable) in enumerate((("표 너비 (cm)", self.width), ("전체 높이 (cm)", self.height))):
+            ttk.Label(size_row, text=label).grid(row=0, column=column * 2, padx=(0, PAD_ROW))
+            entry = ttk.Entry(size_row, textvariable=variable, width=7)
+            entry.grid(row=0, column=column * 2 + 1, padx=(0, PAD_OUTER))
+            self.input_widgets.append(entry)
+        ttk.Label(frame, text="A4 세로 · 여백 2cm · 이름 행 1cm 포함 · 이미지 비율 유지\n"
+                              "너비 1~17cm / 높이 1.5~25.5cm · PNG/JPG/JPEG/GIF/BMP · 하위 폴더 제외").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(0, PAD_ROW))
+
+        actions = ttk.Frame(frame)
+        actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, PAD_OUTER))
+        actions.columnconfigure(0, weight=1)
+        self.status_label = ttk.Label(actions, textvariable=self.status, font=FONT_BOLD, wraplength=450)
+        self.status_label.grid(row=0, column=0, sticky="w")
+        self.refresh_button = ttk.Button(actions, text="목록 확인", command=self.refresh)
+        self.refresh_button.grid(row=0, column=1, padx=(PAD_ROW, PAD_ROW))
+        self.run_button = ttk.Button(actions, text="문서 생성", command=self.run)
+        self.run_button.grid(row=0, column=2)
+        self.input_widgets.extend((self.refresh_button, self.run_button))
+        ttk.Label(frame, textvariable=self.summary, font=FONT_BOLD).grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(0, PAD_ROW))
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(tree_frame, columns=("number", "file", "status"), show="headings")
+        for column, heading, width, stretch in (
+                ("number", "번호", 50, False), ("file", "이미지 파일", 260, True), ("status", "처리 상태", 330, True)):
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, stretch=stretch, anchor="w")
+        self.tree.tag_configure("error", foreground=COLOR_ERROR)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(xscrollcommand=horizontal.set)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        bottom = ttk.Frame(frame)
+        bottom.grid(row=7, column=0, columnspan=3, sticky="e", pady=(PAD_ROW, 0))
+        self.ignore_button = ttk.Button(bottom, text="오류 제외하고 저장", state="disabled",
+                                        command=lambda: self.run(allow_exceptions=True))
+        self.open_button = ttk.Button(bottom, text="결과 파일 열기", state="disabled",
+                                      command=lambda: os.startfile(self.last_output))
+        self.folder_button = ttk.Button(bottom, text="폴더 열기", state="disabled",
+                                        command=lambda: os.startfile(self.last_output.parent))
+        for column, button in enumerate((self.ignore_button, self.open_button, self.folder_button)):
+            button.grid(row=0, column=column, padx=(PAD_ROW, 0))
+        for variable in (self.folder, self.output, self.width, self.height):
+            variable.trace_add("write", self.input_changed)
+
+    def input_changed(self, *_):
+        # 입력이 바뀐 뒤 이전 결과를 새 입력의 결과로 오인해 저장하지 않게 한다.
+        self.reset_result()
+        self.status.set("입력이 변경되었습니다. 목록 확인 또는 문서 생성을 실행하세요.")
+        self.status_label.configure(foreground="")
+        self.summary.set(f"이미지 {len(self.images)}  ·  생성 표 -  ·  정상 -  ·  오류 -")
+        self.tree.delete(*self.tree.get_children())
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.folder.get() or str(BASE_DIR))
+        if folder:
+            self.folder.set(folder)
+            self.refresh()
+
+    def browse_output(self):
+        initial = Path(self.output.get()) if self.output.get() else BASE_DIR / "images.docx"
+        result = filedialog.asksaveasfilename(initialdir=str(initial.parent), initialfile=initial.name,
+                                             defaultextension=".docx", filetypes=[("Word 문서", "*.docx")],
+                                             confirmoverwrite=False)
+        if result:
+            self.output.set(result)
+
+    def reset_result(self):
+        self.last_output = None
+        self.last_inputs = None
+        for button in (self.ignore_button, self.open_button, self.folder_button):
+            button.configure(state="disabled")
+
+    def refresh(self):
+        self.reset_result()
+        self.images = []
+        self.tree.delete(*self.tree.get_children())
+        self.summary.set("이미지 -  ·  생성 표 -  ·  정상 -  ·  오류 -")
+        folder = Path(self.folder.get().strip())
+        try:
+            if not self.folder.get().strip() or not folder.is_dir():
+                raise ValueError("이미지 폴더를 지정하세요.")
+            self.images = list_document_images(folder)
+        except (OSError, ValueError) as error:
+            self.status.set(f"오류: {error}")
+            self.status_label.configure(foreground=COLOR_ERROR)
+            return False
+        if folder.resolve() != self.loaded_folder:
+            suggested = str(default_created_document_path(folder))
+            if not self.output.get().strip() or self.output.get() == self.suggested_output:
+                self.output.set(suggested)
+            self.suggested_output = suggested
+            self.loaded_folder = folder.resolve()
+        for number, path in enumerate(self.images, 1):
+            self.tree.insert("", "end", values=(number, path.name, "대기"))
+        self.summary.set(f"이미지 {len(self.images)}  ·  생성 표 -  ·  정상 -  ·  오류 -")
+        if not self.images:
+            self.summary.set("이미지 0  ·  생성 표 0  ·  정상 0  ·  오류 0")
+        self.status.set("목록 확인 완료" if self.images else "지원하는 이미지가 없습니다. 저장하지 않습니다.")
+        self.status_label.configure(foreground="" if self.images else COLOR_ERROR)
+        return bool(self.images)
+
+    def run(self, allow_exceptions=False):
+        if allow_exceptions:
+            inputs = self.last_inputs
+            if inputs is None:
+                return
+        else:
+            if not self.refresh():
+                return
+            try:
+                width, height = float(self.width.get()), float(self.height.get())
+                validate_table_size(width, height)
+                if not self.output.get().strip():
+                    raise ValueError("결과 파일 경로를 지정하세요.")
+                output = Path(self.output.get().strip())
+                if output.suffix.lower() != ".docx":
+                    raise ValueError("결과 파일 확장자는 .docx여야 합니다.")
+                if not output.parent.is_dir():
+                    raise ValueError("결과 파일의 저장 폴더가 없습니다.")
+            except ValueError as error:
+                self.status.set(f"입력 확인: {error}")
+                self.status_label.configure(foreground=COLOR_ERROR)
+                messagebox.showwarning("입력 확인", str(error))
+                return
+            inputs = (list(self.images), output, width, height)
+        if inputs[1].exists() and not messagebox.askyesno(
+                "덮어쓰기 확인", f"결과 파일이 이미 있습니다. 덮어쓸까요?\n{inputs[1]}"):
+            return
+        self.last_inputs = inputs
+        self.last_output = None
+        self.set_running(True)
+        threading.Thread(target=self.worker, args=(*inputs, allow_exceptions), daemon=True).start()
+        self.root.after(POLL_INTERVAL_MS, self.poll_result)
+
+    def set_running(self, running):
+        self.app.notebook.tab(self.app.insert_tab, state="disabled" if running else "normal")
+        for widget in self.input_widgets:
+            widget.configure(state="disabled" if running else "normal")
+        if running:
+            for button in (self.ignore_button, self.open_button, self.folder_button):
+                button.configure(state="disabled")
+            self.status.set("처리 중...")
+            self.status_label.configure(foreground="")
+
+    def worker(self, images, output, width, height, allow_exceptions):
+        try:
+            result = create_document_from_images(images, output, width, height, allow_exceptions)
+        except Exception as error:
+            result = error
+        self.result_queue.put(result)
+
+    def poll_result(self):
+        try:
+            report = self.result_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(POLL_INTERVAL_MS, self.poll_result)
+            return
+        self.set_running(False)
+        if isinstance(report, Exception):
+            self.status.set(f"실패: {report}")
+            self.status_label.configure(foreground=COLOR_ERROR)
+            self.summary.set(f"이미지 {len(self.last_inputs[0])}  ·  생성 표 -  ·  정상 -  ·  오류 -")
+            return
+        self.tree.delete(*self.tree.get_children())
+        for number, row in enumerate(report.rows, 1):
+            detail = f"{row.status}: {row.message}" if row.message else row.status
+            self.tree.insert("", "end", values=(number, row.image_path.name, detail),
+                             tags=("error",) if row.is_exception else ())
+        self.summary.set(f"이미지 {report.image_count}  ·  생성 표 {report.target_count}  ·  "
+                         f"정상 {report.normal_count}  ·  오류 {report.exception_count}")
+        self.ignore_button.configure(state="normal" if report.can_save_ignoring_exceptions else "disabled")
+        if report.saved:
+            self.last_output = report.output_path
+            for button in (self.open_button, self.folder_button):
+                button.configure(state="normal")
+            prefix = f"완료 (오류 {report.exception_count}건 제외)" if report.exception_count else "완료"
+            self.status.set(f"{prefix}: {report.output_path.name}")
+            self.status_label.configure(foreground=COLOR_WARNING if report.exception_count else "")
+        else:
+            self.status.set(f"실패: 오류 {report.exception_count}건, 저장하지 않았습니다.")
+            self.status_label.configure(foreground=COLOR_ERROR)
 
 
 if __name__ == "__main__":
